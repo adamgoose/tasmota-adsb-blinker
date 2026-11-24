@@ -24,16 +24,29 @@ Your LED hardware (pins, strip type, LED count, color order, power limits) is co
   - starts a flash sequence, drawn in `handleOverlayDraw()` on top of the current effect, or
   - calls `applyPreset()`.
 
-## Build
+## Prebuilt firmware
+
+Every push to `main` builds WLED **v16.0.1** with this usermod (and WLED's default AudioReactive usermod) and publishes it to the [**latest** release](https://github.com/adamgoose/tasmota-adsb-blinker/releases/tag/latest):
+
+| File | For |
+| --- | --- |
+| `WLED_16.0.1_ESP32_adsb-blinker.bin` | Classic ESP32 (4 MB flash), WLED's `esp32dev` |
+| `WLED_16.0.1_ESP32-C3_adsb-blinker.bin` | ESP32-C3 (4 MB flash), WLED's `esp32c3dev` |
+
+Upload the file matching your chip through **Config → Security & Updates → Manual OTA update**. WLED refuses a file whose release name (`ESP32` / `ESP32-C3`) doesn't match the running firmware. `SHA256SUMS` is attached for checking downloads.
+
+The workflow is [`.github/workflows/firmware.yml`](../.github/workflows/firmware.yml). To build against a newer WLED, change `WLED_VERSION` there. To add a board, add a row to its `matrix` (a WLED environment name plus its release name). It can also be run by hand from the repo's **Actions** tab.
+
+## Build it yourself
 
 The usermod is a PlatformIO library (the manifest is [`library.json`](../library.json) at the repo root, pointing at `wled/`). WLED pulls it in through `custom_usermods`, which needs WLED 16 or newer.
 
 | WLED | `esp32dev` (classic ESP32) | `esp32c3dev` |
 | --- | --- | --- |
-| **v16.0.1** (stable, recommended) | Builds clean | Not built yet (see the toolchain note below) |
+| **v16.0.1** (stable, recommended) | Builds clean (locally and in CI) | Built in CI (see the toolchain note below) |
 | `main` (`17.0.0-devV5`, `3f065cb`) | Builds clean; ran on a classic ESP32 | Builds clean; running on a QT Py ESP32-C3 with live traffic, both output modes and the watch list |
 
-Toolchain note: on WLED 16 the ESP32-C3 environment uses GCC 8.4.0, which is only published for Intel. On an Apple Silicon Mac you need Rosetta (`softwareupdate --install-rosetta`) or a Linux machine or CI to build it. The classic ESP32 environment builds natively.
+Toolchain note: on WLED 16 the ESP32-C3 environment uses GCC 8.4.0, which is only published for Intel. On an Apple Silicon Mac you need Rosetta (`softwareupdate --install-rosetta`) or a Linux machine to build it, or just use the CI build above. The classic ESP32 environment builds natively.
 
 1. Clone the WLED release and install [PlatformIO](https://platformio.org/). WLED's ESP32 platform needs Python 3.10 or newer.
    ```sh

@@ -21,6 +21,10 @@ There are two versions, which share the same detection logic:
 - **Tasmota:** good if the device already runs Tasmota, or if you want to tweak behavior live without reflashing.
 - **WLED:** good for custom boards and LED setups (pins, strip types and effects are all set in the WLED UI), or if you want proper effects or presets for each event.
 
+## Prebuilt WLED firmware
+
+Every push to `main` builds the WLED version (on WLED v16.0.1) for classic ESP32 and ESP32-C3 and publishes the `.bin` files to the [**latest** release](https://github.com/adamgoose/tasmota-adsb-blinker/releases/tag/latest). See [wled/README.md](wled/README.md#prebuilt-firmware).
+
 ## How detection works (both versions)
 
 1. Look up the airport's coordinates once from the [aviationweather.gov airport API](https://aviationweather.gov/data/api/) and save them.
@@ -41,6 +45,7 @@ tasmota/README.md          Tasmota install, usage, tuning, porting guide
 wled/adsb_blinker.cpp      WLED usermod
 wled/README.md             WLED build, settings, development guide
 library.json               PlatformIO manifest so WLED can pull the usermod from this repo
+.github/workflows/         CI: builds and publishes the WLED firmware on every push to main
 ```
 
 ## Data and terms
