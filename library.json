@@ -1,0 +1,13 @@
+{
+  "name": "tasmota-adsb-blinker",
+  "version": "0.1.0",
+  "description": "WLED usermod: flash LEDs or apply presets when planes land at or depart from an airport (adsb.fi ADS-B data)",
+  "platforms": ["espressif32"],
+  "build": {
+    "libArchive": false,
+    "srcDir": "wled"
+  },
+  "dependencies": {
+    "mobizt/ESP_SSLClient": "3.1.3"
+  }
+}
