@@ -35,7 +35,7 @@
 #define ADSB_TASK_STACK   12288     // BearSSL handshake needs a deep stack
 #define ADSB_TLS_RX_BUF   16709     // a full TLS record (16 KB + overhead)
 #define ADSB_TLS_TX_BUF   1024
-#define ADSB_DOC_SIZE     24576     // filtered aircraft list; ~100 B per aircraft
+#define ADSB_DOC_SIZE     40960     // filtered aircraft list; ~150 B per aircraft (~250 aircraft)
 #define ADSB_FORGET_MS    180000UL  // drop aircraft not seen for 3 minutes
 #define ADSB_FLASH_ON_MS  150
 #define ADSB_FLASH_GAP_MS 400
@@ -50,7 +50,7 @@ body{background:#222;color:#fff;font-family:Helvetica,Verdana,sans-serif;margin:
 h2{margin:8px 0 4px}#s{color:#aaa;font-size:14px;margin-bottom:14px}
 table{margin:0 auto;border-collapse:collapse;width:100%;max-width:560px}
 td,th{padding:9px 6px;border-bottom:1px solid #333;text-align:left}th{color:#aaa;font-weight:normal;font-size:13px}
-.d{color:#5e5}.a{color:#6af}.m{color:#888}
+.d{color:#5e5}.a{color:#6af}.w{color:#fc4}.m{color:#888}
 button{background:#333;color:#fff;border:0;border-radius:24px;padding:8px 20px;margin:8px 4px;font-size:15px;cursor:pointer}
 </style></head><body><button onclick="location.href='/'">Back</button>
 <h2 id="h">Flights</h2><div id="s"></div>
@@ -60,11 +60,11 @@ function E(x){return String(x).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
 function f(){fetch('/adsb/log').then(r=>r.json()).then(j=>{
 h.textContent=j.icao?j.icao+' landings & departures':'Flights';
 let P=(n,w)=>n+' '+w+(n==1?'':'s');
-s.textContent=j.status+' · '+P(j.deps,'departure')+', '+P(j.arrs,'landing')+' since boot';
-let n=Date.now();
-b.innerHTML=j.events.length?j.events.map(e=>{let t=new Date(n-e.ago*1000),d=e.k=='dep';
-return '<tr><td>'+t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</td><td class='+(d?'d':'a')+'>'
-+(d?'↑ Departure':'↓ Landing')+(e.ap!=j.icao?' <span class=m>'+E(e.ap)+'</span>':'')
+s.textContent=j.status+' · '+P(j.deps,'departure')+', '+P(j.arrs,'landing')+(j.spots?', '+P(j.spots,'sighting'):'')+' since boot';
+let n=Date.now(),K={dep:['d','↑ Departure'],arr:['a','↓ Landing'],watch:['w','★ Spotted']};
+b.innerHTML=j.events.length?j.events.map(e=>{let t=new Date(n-e.ago*1000),k=K[e.k]||K.arr;
+return '<tr><td>'+t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</td><td class='+k[0]+'>'
++k[1]+(e.ap!=j.icao?' <span class=m>'+E(e.ap)+'</span>':'')
 +'</td><td>'+E(e.cs)+'</td><td>'+E(e.t)+'</td></tr>'}).join('')
 :'<tr><td colspan=4 class=m style="text-align:center">No landings or departures yet</td></tr>'
 }).catch(()=>{s.textContent='Can\'t reach the device'})}
@@ -105,15 +105,18 @@ static int adsbGetJson(const char* host, const char* path, JsonDocument& filter,
 
 class AdsbBlinker : public Usermod {
   public:
-    enum Kind : uint8_t { DEPARTURE = 0, LANDING = 1 };
+    enum Kind : uint8_t { DEPARTURE = 0, LANDING = 1, WATCH = 2 };
     enum Mode : uint8_t { MODE_FLASH = 0, MODE_PRESET = 1 };
 
   private:
-    struct Event { uint8_t kind; char callsign[10]; char type[6]; };
+    // preset: WATCH only, the entry's own preset (0 = use the default watch preset)
+    struct Event { uint8_t kind; uint8_t preset; char callsign[10]; char type[6]; };
     struct Track { bool ground; uint32_t seen; };
+    struct WatchRule { String pattern; uint8_t preset; };
     // What the polling task needs, copied under the mutex
     struct Snapshot {
       bool enabled; char icao[8]; float lat, lon; int radius, pollSec, airKt; uint32_t gen;
+      String watchList; int watchRadius;
     };
 
     // ---- settings (Usermod settings page / cfg.json) ----
@@ -130,6 +133,10 @@ class AdsbBlinker : public Usermod {
     int     depPreset  = 0;
     int     arrPreset  = 0;
     int     presetSec  = 10;       // 0 = leave the preset on
+    String  watchList;             // "N123AB, DAL*, UAL123=4" (callsigns or tail numbers)
+    int     watchPreset = 0;       // default preset for watch hits
+    int     watchSec   = 30;       // 0 = leave the preset on
+    int     watchRadius = 10;      // NM; polled area = max(radiusNm, watchRadius)
     // cached lookup, kept in /adsb.json (not in the settings) so a reboot needs no new lookup
     String  resolvedIcao;
     float   lat = NAN, lon = NAN;
@@ -146,7 +153,7 @@ class AdsbBlinker : public Usermod {
     struct LogEntry { uint32_t ms; uint8_t kind; char callsign[10]; char type[6]; char icao[8]; };
     LogEntry evLog[ADSB_LOG_SIZE];
     uint8_t  logHead = 0, logLen = 0;   // logHead = next slot to write
-    uint32_t deps = 0, arrs = 0;
+    uint32_t deps = 0, arrs = 0, spots = 0;
 
     // ---- runtime (main loop only) ----
     uint32_t fxColor = 0;
@@ -180,9 +187,11 @@ class AdsbBlinker : public Usermod {
 
     // ---------- preset mode with timed restore ----------
 
-    void startPreset(int p) {
+    // secs = how long to show it (0 = leave it on). Overlapping events extend the
+    // timer; the look restored at the end is the one from before the first event.
+    void startPreset(int p, int secs) {
       if (p <= 0 || p > 250) return;
-      if (!presetActive && presetSec > 0) {      // first event: remember the current look
+      if (!presetActive && secs > 0) {           // first event: remember the current look
         savedPlaylist = currentPlaylist;
         savedPreset = currentPreset;
         savedState = "";
@@ -193,7 +202,40 @@ class AdsbBlinker : public Usermod {
         }
       }
       applyPreset(p);
-      if (presetSec > 0) { presetActive = true; presetUntil = millis() + presetSec * 1000UL; }
+      if (secs > 0) { presetActive = true; presetUntil = millis() + secs * 1000UL; }
+      else presetActive = false;                 // "leave on" wins: nothing to restore
+    }
+
+    // ---------- watch list ----------
+
+    // "N123AB, DAL*  UAL123=4" -> rules; separators are commas, spaces or newlines
+    static std::vector<WatchRule> parseWatch(const String& list) {
+      std::vector<WatchRule> rules;
+      String tok;
+      auto flush = [&]() {
+        tok.trim(); if (!tok.length()) return;
+        WatchRule r; r.preset = 0;
+        int eq = tok.indexOf('=');
+        if (eq >= 0) { r.preset = constrain(tok.substring(eq + 1).toInt(), 0, 250); tok = tok.substring(0, eq); }
+        tok.trim(); tok.toUpperCase();
+        if (tok.length()) { r.pattern = tok; rules.push_back(r); }
+        tok = "";
+      };
+      for (size_t i = 0; i < list.length(); i++) {
+        char c = list[i];
+        if (c == ',' || c == ';' || c == ' ' || c == '\n' || c == '\r' || c == '\t') flush(); else tok += c;
+      }
+      flush();
+      return rules;
+    }
+
+    // Case-insensitive glob: '*' = any run of characters, '?' = one character
+    static bool globMatch(const char* p, const char* s) {
+      if (!*p) return !*s;
+      if (*p == '*') return globMatch(p + 1, s) || (*s && globMatch(p, s + 1));
+      if (!*s) return false;
+      if (*p == '?' || toupper((unsigned char)*p) == toupper((unsigned char)*s)) return globMatch(p + 1, s + 1);
+      return false;
     }
 
     void endPreset() {
@@ -252,6 +294,7 @@ class AdsbBlinker : public Usermod {
       s.lat = (resolvedIcao == airport) ? lat : NAN;
       s.lon = (resolvedIcao == airport) ? lon : NAN;
       s.radius = radiusNm; s.pollSec = pollSec; s.airKt = airKt; s.gen = gen;
+      s.watchList = watchList; s.watchRadius = watchRadius;
       xSemaphoreGive(mtx);
       return s;
     }
@@ -262,6 +305,7 @@ class AdsbBlinker : public Usermod {
 
     void taskLoop() {
       std::map<uint32_t, Track> tracks;
+      std::map<uint32_t, uint32_t> watched;     // watch-list aircraft in the area -> last seen
       uint32_t trackGen = UINT32_MAX;
       for (;;) {
         Snapshot s = snapshot();
@@ -272,10 +316,10 @@ class AdsbBlinker : public Usermod {
           if (!lookupAirport(s.icao)) { vTaskDelay(pdMS_TO_TICKS(60000)); continue; }
           continue;  // re-snapshot with the new coordinates
         }
-        if (s.gen != trackGen) { tracks.clear(); trackGen = s.gen; }
+        if (s.gen != trackGen) { tracks.clear(); watched.clear(); trackGen = s.gen; }
 
         uint32_t started = millis();
-        pollAdsb(s, tracks);
+        pollAdsb(s, tracks, watched);
         uint32_t waitMs = max(1000, s.pollSec * 1000);   // adsb.fi allows 1 req/s
         uint32_t spent = millis() - started;
         vTaskDelay(pdMS_TO_TICKS(spent < waitMs ? waitMs - spent : 0));
@@ -311,13 +355,18 @@ class AdsbBlinker : public Usermod {
       return true;
     }
 
-    void pollAdsb(const Snapshot& s, std::map<uint32_t, Track>& tracks) {
+    void pollAdsb(const Snapshot& s, std::map<uint32_t, Track>& tracks, std::map<uint32_t, uint32_t>& watched) {
+      // One request covers both circles; adsb.fi's "dst" (NM from the center)
+      // keeps landing/departure detection to the inner radius.
+      std::vector<WatchRule> rules = parseWatch(s.watchList);
+      int pollRadius = rules.empty() ? s.radius : max(s.radius, s.watchRadius);
       char path[80];
-      snprintf(path, sizeof(path), "/api/v3/lat/%.5f/lon/%.5f/dist/%d", s.lat, s.lon, s.radius);
+      snprintf(path, sizeof(path), "/api/v3/lat/%.5f/lon/%.5f/dist/%d", s.lat, s.lon, pollRadius);
       // Keep only the fields we use; this also skips the 13-digit timestamps
-      StaticJsonDocument<192> filter;
+      StaticJsonDocument<256> filter;
       JsonObject f = filter["ac"].createNestedObject();
-      f["hex"] = true; f["flight"] = true; f["t"] = true; f["alt_baro"] = true; f["gs"] = true;
+      f["hex"] = true; f["flight"] = true; f["r"] = true; f["t"] = true;
+      f["alt_baro"] = true; f["gs"] = true; f["dst"] = true;
       DynamicJsonDocument doc(ADSB_DOC_SIZE);
       DeserializationError err;
       int code = adsbGetJson("opendata.adsb.fi", path, filter, doc, &err);
@@ -332,12 +381,38 @@ class AdsbBlinker : public Usermod {
       }
 
       uint32_t now = millis();
+      unsigned nearby = 0;
       JsonArray acs = doc["ac"];
       for (JsonObject a : acs) {
         const char* hex = a["hex"] | "";
         bool nonIcao = (*hex == '~');           // TIS-B / non-ICAO addresses
         uint32_t id = strtoul(hex + (nonIcao ? 1 : 0), nullptr, 16) | (nonIcao ? 0x1000000UL : 0);
         if (!id) continue;
+
+        // Watch list: fire once when a matching aircraft shows up in the polled area
+        if (!rules.empty()) {
+          char cs[12], reg[12];
+          cleanCopy(cs, a["flight"] | "", sizeof(cs));
+          cleanCopy(reg, a["r"] | "", sizeof(reg));
+          for (const WatchRule& r : rules) {
+            bool hit = (cs[0] != '?' && globMatch(r.pattern.c_str(), cs)) ||
+                       (reg[0] != '?' && globMatch(r.pattern.c_str(), reg));
+            if (!hit) continue;
+            if (!watched.count(id)) {
+              Event ev; ev.kind = WATCH; ev.preset = r.preset;
+              strlcpy(ev.callsign, cs[0] != '?' ? cs : reg, sizeof(ev.callsign));
+              cleanCopy(ev.type, a["t"] | "?", sizeof(ev.type));
+              xQueueSend(events, &ev, 0);
+            }
+            watched[id] = now;
+            break;
+          }
+        }
+
+        // Landings and departures: only within the airport radius
+        float dst = a["dst"] | 0.0f;
+        if (dst > s.radius) continue;
+        nearby++;
         JsonVariant alt = a["alt_baro"];
         float gs = a["gs"] | 0.0f;
         int8_t ground = -1;                      // -1 = ambiguous, keep previous state
@@ -347,7 +422,7 @@ class AdsbBlinker : public Usermod {
         auto it = tracks.find(id);
         if (ground < 0) { if (it != tracks.end()) it->second.seen = now; continue; }
         if (it != tracks.end() && it->second.ground != (bool)ground) {
-          Event ev; ev.kind = ground ? LANDING : DEPARTURE;
+          Event ev; ev.kind = ground ? LANDING : DEPARTURE; ev.preset = 0;
           cleanCopy(ev.callsign, a["flight"] | hex, sizeof(ev.callsign));
           cleanCopy(ev.type, a["t"] | "?", sizeof(ev.type));
           xQueueSend(events, &ev, 0);
@@ -356,8 +431,15 @@ class AdsbBlinker : public Usermod {
       }
       for (auto it = tracks.begin(); it != tracks.end(); )
         it = (now - it->second.seen > ADSB_FORGET_MS) ? tracks.erase(it) : std::next(it);
+      // a watched aircraft gone this long can trigger again when it returns
+      for (auto it = watched.begin(); it != watched.end(); )
+        it = (now - it->second > ADSB_FORGET_MS) ? watched.erase(it) : std::next(it);
 
-      char msg[48]; snprintf(msg, sizeof(msg), "%s: %u aircraft", s.icao, (unsigned)acs.size());
+      char msg[48];
+      if (pollRadius > s.radius)
+        snprintf(msg, sizeof(msg), "%s: %u nearby, %u within %d NM", s.icao, nearby, (unsigned)acs.size(), pollRadius);
+      else
+        snprintf(msg, sizeof(msg), "%s: %u aircraft", s.icao, nearby);
       setStatus(msg);
     }
 
@@ -380,7 +462,7 @@ class AdsbBlinker : public Usermod {
       strlcpy(e.icao, airport.c_str(), sizeof(e.icao));
       logHead = (logHead + 1) % ADSB_LOG_SIZE;
       if (logLen < ADSB_LOG_SIZE) logLen++;
-      if (ev.kind == DEPARTURE) deps++; else arrs++;
+      if (ev.kind == DEPARTURE) deps++; else if (ev.kind == LANDING) arrs++; else spots++;
       xSemaphoreGive(mtx);
     }
 
@@ -398,12 +480,12 @@ class AdsbBlinker : public Usermod {
     void sendLog(AsyncWebServerRequest* request) {
       DynamicJsonDocument doc(512 + ADSB_LOG_SIZE * 160);
       xSemaphoreTake(mtx, portMAX_DELAY);
-      doc["icao"] = airport; doc["status"] = status; doc["deps"] = deps; doc["arrs"] = arrs;
+      doc["icao"] = airport; doc["status"] = status; doc["deps"] = deps; doc["arrs"] = arrs; doc["spots"] = spots;
       JsonArray evs = doc.createNestedArray("events");
       for (uint8_t i = 0; i < logLen; i++) {
         const LogEntry& e = logAt(i);
         JsonObject o = evs.createNestedObject();
-        o["k"] = e.kind == DEPARTURE ? "dep" : "arr";
+        o["k"] = e.kind == DEPARTURE ? "dep" : e.kind == LANDING ? "arr" : "watch";
         o["cs"] = e.callsign; o["t"] = e.type; o["ap"] = e.icao;
         o["ago"] = (millis() - e.ms) / 1000;
       }
@@ -414,9 +496,13 @@ class AdsbBlinker : public Usermod {
 
     void onEvent(const Event& ev) {
       logEvent(ev);
-      DEBUG_PRINTF_P(PSTR("ADS-B: %s %s (%s)\n"), ev.kind == DEPARTURE ? "dep" : "arr", ev.callsign, ev.type);
+      DEBUG_PRINTF_P(PSTR("ADS-B: %s %s (%s)\n"), ev.kind == DEPARTURE ? "dep" : ev.kind == LANDING ? "arr" : "watch", ev.callsign, ev.type);
+      if (ev.kind == WATCH) {                   // watch hits always use presets
+        startPreset(ev.preset ? ev.preset : watchPreset, watchSec);
+        return;
+      }
       if (mode == MODE_PRESET) {
-        startPreset(ev.kind == DEPARTURE ? depPreset : arrPreset);
+        startPreset(ev.kind == DEPARTURE ? depPreset : arrPreset, presetSec);
         return;
       }
       if (fxLen < sizeof(fxQueue)) fxQueue[(fxHead + fxLen++) % sizeof(fxQueue)] = ev.kind;
@@ -462,7 +548,7 @@ class AdsbBlinker : public Usermod {
       Event ev;
       while (events && xQueueReceive(events, &ev, 0) == pdTRUE) onEvent(ev);
       runFlash();
-      if (presetActive && ((int32_t)(millis() - presetUntil) >= 0 || mode != MODE_PRESET || !enabled)) endPreset();
+      if (presetActive && ((int32_t)(millis() - presetUntil) >= 0 || !enabled)) endPreset();
       if (mtx && lookupDone) {
         xSemaphoreTake(mtx, portMAX_DELAY); lookupDone = false; xSemaphoreGive(mtx);
         saveCache();
@@ -484,11 +570,13 @@ class AdsbBlinker : public Usermod {
       String recent;
       xSemaphoreTake(mtx, portMAX_DELAY);
       snprintf(line, sizeof(line), "%s &middot; dep %u arr %u", status, (unsigned)deps, (unsigned)arrs);
+      if (spots) snprintf(line + strlen(line), sizeof(line) - strlen(line), " &#9733; %u", (unsigned)spots);
       for (uint8_t i = 0; i < logLen && i < ADSB_INFO_RECENT; i++) {
         const LogEntry& e = logAt(i);
         char ago[16]; fmtAgo(ago, sizeof(ago), e.ms);
         char row[64];
-        snprintf(row, sizeof(row), "%s %s %s &middot; %s<br>", e.kind == DEPARTURE ? "&uarr;" : "&darr;", e.callsign, e.type, ago);
+        snprintf(row, sizeof(row), "%s %s %s &middot; %s<br>",
+                 e.kind == DEPARTURE ? "&uarr;" : e.kind == LANDING ? "&darr;" : "&#9733;", e.callsign, e.type, ago);
         recent += row;
       }
       xSemaphoreGive(mtx);
@@ -520,6 +608,11 @@ class AdsbBlinker : public Usermod {
       p[F("departure")]   = depPreset;
       p[F("landing")]     = arrPreset;
       p[F("seconds")]     = presetSec;
+      JsonObject w = top.createNestedObject(F("Watch"));
+      w[F("list")]        = watchList;
+      w[F("preset")]      = watchPreset;
+      w[F("seconds")]     = watchSec;
+      w[F("radius_nm")]   = watchRadius;
       JsonObject det = top.createNestedObject(F("Detection"));
       det[F("poll_s")]      = pollSec;
       det[F("airborne_kt")] = airKt;
@@ -546,6 +639,11 @@ class AdsbBlinker : public Usermod {
         complete &= getJsonValue(p[F("seconds")],       presetSec, 10);
         complete &= getJsonValue(det[F("poll_s")],      pollSec, 10);
         complete &= getJsonValue(det[F("airborne_kt")], airKt, 60);
+        JsonObject w = top[F("Watch")];         // added later: missing = defaults + rewrite
+        complete &= getJsonValue(w[F("list")],      watchList, String(""));
+        complete &= getJsonValue(w[F("preset")],    watchPreset, 0);
+        complete &= getJsonValue(w[F("seconds")],   watchSec, 30);
+        complete &= getJsonValue(w[F("radius_nm")], watchRadius, 10);
       } else if (!top.isNull()) {
         // migrate settings from the first (flat) layout; returning false rewrites them
         getJsonValue(top[F("airport")],    airport, String("KMSP"));
@@ -570,6 +668,10 @@ class AdsbBlinker : public Usermod {
       pollSec    = constrain(pollSec, 2, 3600);
       flashCount = constrain(flashCount, 1, 20);
       presetSec  = constrain(presetSec, 0, 86400);
+      watchList.trim();
+      watchPreset = constrain(watchPreset, 0, 250);
+      watchSec    = constrain(watchSec, 0, 86400);
+      watchRadius = constrain(watchRadius, 1, 100);   // keeps responses within ADSB_DOC_SIZE
       if (airport != oldAirport || radiusNm != oldRadius) gen++;
       if (mtx) xSemaphoreGive(mtx);
       return complete;
@@ -595,16 +697,20 @@ class AdsbBlinker : public Usermod {
         "L('Flash:count','Flashes');L('Flash:leds','LEDs','(0 = all)');"
         "L('Preset:departure','Departure preset');L('Preset:landing','Landing preset');"
         "L('Preset:seconds','Show for','seconds, then restore (0 = leave on)');"
-        "for(let f of['Flash:departure','Flash:landing'])I(f).type='color';"));
+        "for(let f of['Flash:departure','Flash:landing'])I(f).type='color';"
+        "L('Watch:list','Callsigns / tail numbers');I('Watch:list').placeholder='N123AB, DAL*, UAL123=4';"
+        "I('Watch:list').insertAdjacentHTML('afterend','<br><i>comma-separated &middot; * = wildcard &middot; =ID for its own preset</i>');"
+        "L('Watch:preset','Default preset');L('Watch:seconds','Show for','seconds (0 = leave on)');"
+        "L('Watch:radius_nm','Watch within','NM');"));
       oappend(F("let s=addDropdown('ADS-B Blinker','Action:type');addOption(s,'Flash the LEDs',0);addOption(s,'Apply a preset',1);"
         "let gf=G('Flash'),gp=G('Preset'),T=()=>{gf.style.display=s.value==0?'':'none';gp.style.display=s.value==1?'':'none';};"
         "s.addEventListener('change',T);T();"
-        "let pd=['Preset:departure','Preset:landing'].map(f=>addDropdown('ADS-B Blinker',f));"
+        "let pd=['Preset:departure','Preset:landing','Watch:preset'].map(f=>addDropdown('ADS-B Blinker',f));"
         "pd.forEach(x=>addOption(x,'None',0));"
         "fetch('/presets.json').then(r=>r.json()).then(j=>{for(let k in j)if(k>0&&j[k].n)pd.forEach(x=>addOption(x,k+': '+j[k].n,k));});"));
     }
 
-    // Test from the JSON API: {"adsb":{"test":"dep"}} or {"adsb":{"test":"arr"}}
+    // Test from the JSON API: {"adsb":{"test":"dep"}}, "arr" or "watch"
     // This runs in the web server's task while WLED is applying the request, so
     // only queue the event; loop() handles it like a real one.
     void readFromJsonState(JsonObject& root) override {
@@ -612,7 +718,7 @@ class AdsbBlinker : public Usermod {
       if (um.isNull() || !events) return;
       const char* t = um[F("test")] | "";
       if (!*t) return;
-      Event ev; ev.kind = (t[0] == 'a') ? LANDING : DEPARTURE;
+      Event ev; ev.kind = (t[0] == 'a') ? LANDING : (t[0] == 'w') ? WATCH : DEPARTURE; ev.preset = 0;
       strlcpy(ev.callsign, "TEST", sizeof(ev.callsign)); strlcpy(ev.type, "-", sizeof(ev.type));
       xQueueSend(events, &ev, 0);
     }
