@@ -92,13 +92,14 @@ class AdsbBlinker : public Usermod {
     int     pollSec    = 10;
     int     airKt      = 60;
     uint8_t mode       = MODE_FLASH;
-    String  depColor   = "00FF00";
-    String  arrColor   = "0000FF";
+    String  depColor   = "#00ff00";
+    String  arrColor   = "#0000ff";
     int     flashCount = 3;
     int     flashLeds  = 0;        // 0 = every LED
     int     depPreset  = 0;
     int     arrPreset  = 0;
-    // cached lookup, stored so a reboot needs no new lookup
+    int     presetSec  = 10;       // 0 = leave the preset on
+    // cached lookup, kept in /adsb.json (not in the settings) so a reboot needs no new lookup
     String  resolvedIcao;
     float   lat = NAN, lon = NAN;
 
@@ -118,13 +119,88 @@ class AdsbBlinker : public Usermod {
     uint32_t fxNext = 0;
     bool     fxOn = false;
     uint8_t  fxQueue[8]; uint8_t fxHead = 0, fxLen = 0;
+    // preset mode: what to go back to when the preset's time is up
+    bool     presetActive = false;
+    uint32_t presetUntil = 0;
+    int16_t  savedPlaylist = -1;   // a running playlist is restarted rather than snapshotted
+    byte     savedPreset = 0;
+    // Kept as JSON text: serializeState() writes segment colors as raw
+    // pre-rendered JSON, which only becomes a real array once re-parsed.
+    String   savedState;
 
     static const char _name[];
+    static const char _cacheFile[];
 
-    static uint32_t parseHex(const String& s, uint32_t fallback) {
+    static uint32_t parseHex(String s, uint32_t fallback) {
+      s.trim(); if (s.startsWith("#")) s.remove(0, 1);
       if (s.length() != 6) return fallback;
       char* end; uint32_t v = strtoul(s.c_str(), &end, 16);
       return *end ? fallback : v;
+    }
+
+    static String normColor(String s, const char* fallback) {
+      s.trim(); s.toLowerCase(); if (!s.startsWith("#")) s = "#" + s;
+      return (s.length() == 7 && parseHex(s, 0xFFFFFFFF) != 0xFFFFFFFF) ? s : String(fallback);
+    }
+
+    // ---------- preset mode with timed restore ----------
+
+    void startPreset(int p) {
+      if (p <= 0 || p > 250) return;
+      if (!presetActive && presetSec > 0) {      // first event: remember the current look
+        savedPlaylist = currentPlaylist;
+        savedPreset = currentPreset;
+        savedState = "";
+        if (savedPlaylist < 0) {
+          DynamicJsonDocument snap(6144);
+          serializeState(snap.to<JsonObject>(), true);
+          if (!snap.overflowed()) serializeJson(snap, savedState);
+        }
+      }
+      applyPreset(p);
+      if (presetSec > 0) { presetActive = true; presetUntil = millis() + presetSec * 1000UL; }
+    }
+
+    void endPreset() {
+      presetActive = false;
+      bool restored = false;
+      if (savedPlaylist >= 0) { applyPreset(savedPlaylist); restored = true; }   // restart the playlist
+      else if (savedState.length()) {
+        DynamicJsonDocument snap(6144);
+        if (!deserializeJson(snap, savedState)) {
+          deserializeState(snap.as<JsonObject>(), CALL_MODE_DIRECT_CHANGE, savedPreset);
+          restored = true;
+        }
+      }
+      if (!restored && savedPreset) applyPreset(savedPreset);              // best effort
+      savedState = "";
+    }
+
+    // ---------- coordinate cache (/adsb.json) ----------
+
+    // A tiny standalone file, so plain read/write of the whole file is enough.
+    void loadCache() {
+      File f = WLED_FS.open(_cacheFile, "r");
+      if (!f) return;
+      StaticJsonDocument<192> c;
+      DeserializationError err = deserializeJson(c, f);
+      f.close();
+      if (err || !c["lat"].is<float>() || !c["lon"].is<float>()) return;
+      xSemaphoreTake(mtx, portMAX_DELAY);
+      resolvedIcao = c["icao"] | "";
+      lat = c["lat"]; lon = c["lon"];
+      xSemaphoreGive(mtx);
+    }
+
+    void saveCache() {
+      StaticJsonDocument<192> c;
+      xSemaphoreTake(mtx, portMAX_DELAY);
+      c["icao"] = resolvedIcao; c["lat"] = lat; c["lon"] = lon;
+      xSemaphoreGive(mtx);
+      File f = WLED_FS.open(_cacheFile, "w");
+      if (!f) return;
+      serializeJson(c, f);
+      f.close();
     }
 
     void setStatus(const char* s) {
@@ -259,8 +335,7 @@ class AdsbBlinker : public Usermod {
       snprintf(lastEvent, sizeof(lastEvent), "%s %s (%s)", ev.kind == DEPARTURE ? "dep" : "arr", ev.callsign, ev.type);
       DEBUG_PRINTF_P(PSTR("ADS-B: %s\n"), lastEvent);
       if (mode == MODE_PRESET) {
-        int p = ev.kind == DEPARTURE ? depPreset : arrPreset;
-        if (p > 0 && p < 251) applyPreset(p);
+        startPreset(ev.kind == DEPARTURE ? depPreset : arrPreset);
         return;
       }
       if (fxLen < sizeof(fxQueue)) fxQueue[(fxHead + fxLen++) % sizeof(fxQueue)] = ev.kind;
@@ -292,6 +367,8 @@ class AdsbBlinker : public Usermod {
     void setup() override {
       mtx = xSemaphoreCreateMutex();
       events = xQueueCreate(8, sizeof(Event));
+      if (isnan(lat)) loadCache();
+      else saveCache();              // migrated from cfg.json (older versions kept it there)
       xTaskCreate(taskEntry, "adsb", ADSB_TASK_STACK, this, 1, &task);
     }
 
@@ -299,9 +376,10 @@ class AdsbBlinker : public Usermod {
       Event ev;
       while (events && xQueueReceive(events, &ev, 0) == pdTRUE) onEvent(ev);
       runFlash();
+      if (presetActive && ((int32_t)(millis() - presetUntil) >= 0 || mode != MODE_PRESET || !enabled)) endPreset();
       if (mtx && lookupDone) {
         xSemaphoreTake(mtx, portMAX_DELAY); lookupDone = false; xSemaphoreGive(mtx);
-        configNeedsWrite = true;     // persist the resolved coordinates
+        saveCache();
       }
     }
 
@@ -324,89 +402,128 @@ class AdsbBlinker : public Usermod {
       arr.add(line);
     }
 
+    // Settings are grouped into nested objects; WLED shows each one as a titled
+    // section on the Usermod settings page. appendConfigData() then relabels the
+    // fields and adds color pickers, preset dropdowns and show/hide by action.
     void addToConfig(JsonObject& root) override {
-      if (mtx) xSemaphoreTake(mtx, portMAX_DELAY);   // the task may be writing lat/lon
       JsonObject top = root.createNestedObject(FPSTR(_name));
-      top[F("enabled")]     = enabled;
-      top[F("airport")]     = airport;
-      top[F("radiusNm")]    = radiusNm;
-      top[F("pollSec")]     = pollSec;
-      top[F("airborneKt")]  = airKt;
-      top[F("mode")]        = mode;
-      top[F("depColor")]    = depColor;
-      top[F("arrColor")]    = arrColor;
-      top[F("flashCount")]  = flashCount;
-      top[F("flashLeds")]   = flashLeds;
-      top[F("depPreset")]   = depPreset;
-      top[F("arrPreset")]   = arrPreset;
-      top[F("resolvedIcao")] = resolvedIcao;
-      top[F("lat")]         = lat;
-      top[F("lon")]         = lon;
-      if (mtx) xSemaphoreGive(mtx);
+      top[F("enabled")] = enabled;
+      JsonObject a = top.createNestedObject(F("Airport"));
+      a[F("icao")]        = airport;
+      a[F("radius_nm")]   = radiusNm;
+      JsonObject act = top.createNestedObject(F("Action"));
+      act[F("type")]      = mode;
+      JsonObject f = top.createNestedObject(F("Flash"));
+      f[F("departure")]   = depColor;
+      f[F("landing")]     = arrColor;
+      f[F("count")]       = flashCount;
+      f[F("leds")]        = flashLeds;
+      JsonObject p = top.createNestedObject(F("Preset"));
+      p[F("departure")]   = depPreset;
+      p[F("landing")]     = arrPreset;
+      p[F("seconds")]     = presetSec;
+      JsonObject det = top.createNestedObject(F("Detection"));
+      det[F("poll_s")]      = pollSec;
+      det[F("airborne_kt")] = airKt;
     }
 
     bool readFromConfig(JsonObject& root) override {
       JsonObject top = root[FPSTR(_name)];
-      bool complete = !top.isNull();
       if (mtx) xSemaphoreTake(mtx, portMAX_DELAY);
       String oldAirport = airport; int oldRadius = radiusNm;
-      complete &= getJsonValue(top[F("enabled")],    enabled, false);
-      complete &= getJsonValue(top[F("airport")],    airport, String("KMSP"));
-      complete &= getJsonValue(top[F("radiusNm")],   radiusNm, 3);
-      complete &= getJsonValue(top[F("pollSec")],    pollSec, 10);
-      complete &= getJsonValue(top[F("airborneKt")], airKt, 60);
-      complete &= getJsonValue(top[F("mode")],       mode, (uint8_t)MODE_FLASH);
-      complete &= getJsonValue(top[F("depColor")],   depColor, String("00FF00"));
-      complete &= getJsonValue(top[F("arrColor")],   arrColor, String("0000FF"));
-      complete &= getJsonValue(top[F("flashCount")], flashCount, 3);
-      complete &= getJsonValue(top[F("flashLeds")],  flashLeds, 0);
-      complete &= getJsonValue(top[F("depPreset")],  depPreset, 0);
-      complete &= getJsonValue(top[F("arrPreset")],  arrPreset, 0);
-      getJsonValue(top[F("resolvedIcao")], resolvedIcao, String(""));
-      if (!top[F("lat")].isNull()) lat = top[F("lat")].as<float>();
-      if (!top[F("lon")].isNull()) lon = top[F("lon")].as<float>();
+      bool complete = !top.isNull() && !top[F("Airport")].isNull();
+      getJsonValue(top[F("enabled")], enabled, false);
+      if (complete) {
+        JsonObject a = top[F("Airport")], act = top[F("Action")], f = top[F("Flash")],
+                   p = top[F("Preset")], det = top[F("Detection")];
+        complete &= getJsonValue(a[F("icao")],          airport, String("KMSP"));
+        complete &= getJsonValue(a[F("radius_nm")],     radiusNm, 3);
+        complete &= getJsonValue(act[F("type")],        mode, (uint8_t)MODE_FLASH);
+        complete &= getJsonValue(f[F("departure")],     depColor, String("#00ff00"));
+        complete &= getJsonValue(f[F("landing")],       arrColor, String("#0000ff"));
+        complete &= getJsonValue(f[F("count")],         flashCount, 3);
+        complete &= getJsonValue(f[F("leds")],          flashLeds, 0);
+        complete &= getJsonValue(p[F("departure")],     depPreset, 0);
+        complete &= getJsonValue(p[F("landing")],       arrPreset, 0);
+        complete &= getJsonValue(p[F("seconds")],       presetSec, 10);
+        complete &= getJsonValue(det[F("poll_s")],      pollSec, 10);
+        complete &= getJsonValue(det[F("airborne_kt")], airKt, 60);
+      } else if (!top.isNull()) {
+        // migrate settings from the first (flat) layout; returning false rewrites them
+        getJsonValue(top[F("airport")],    airport, String("KMSP"));
+        getJsonValue(top[F("radiusNm")],   radiusNm, 3);
+        getJsonValue(top[F("pollSec")],    pollSec, 10);
+        getJsonValue(top[F("airborneKt")], airKt, 60);
+        getJsonValue(top[F("mode")],       mode, (uint8_t)MODE_FLASH);
+        getJsonValue(top[F("depColor")],   depColor, String("#00ff00"));
+        getJsonValue(top[F("arrColor")],   arrColor, String("#0000ff"));
+        getJsonValue(top[F("flashCount")], flashCount, 3);
+        getJsonValue(top[F("flashLeds")],  flashLeds, 0);
+        getJsonValue(top[F("depPreset")],  depPreset, 0);
+        getJsonValue(top[F("arrPreset")],  arrPreset, 0);
+        getJsonValue(top[F("resolvedIcao")], resolvedIcao, String(""));
+        if (!top[F("lat")].isNull()) lat = top[F("lat")].as<float>();
+        if (!top[F("lon")].isNull()) lon = top[F("lon")].as<float>();
+      }
       airport.trim(); airport.toUpperCase();
-      depColor.trim(); depColor.toUpperCase(); if (depColor.startsWith("#")) depColor.remove(0, 1);
-      arrColor.trim(); arrColor.toUpperCase(); if (arrColor.startsWith("#")) arrColor.remove(0, 1);
-      radiusNm = constrain(radiusNm, 1, 250);
-      pollSec  = constrain(pollSec, 2, 3600);
+      depColor = normColor(depColor, "#00ff00");
+      arrColor = normColor(arrColor, "#0000ff");
+      radiusNm   = constrain(radiusNm, 1, 250);
+      pollSec    = constrain(pollSec, 2, 3600);
       flashCount = constrain(flashCount, 1, 20);
+      presetSec  = constrain(presetSec, 0, 86400);
       if (airport != oldAirport || radiusNm != oldRadius) gen++;
       if (mtx) xSemaphoreGive(mtx);
       return complete;
     }
 
     void appendConfigData() override {
-      oappend(F("addInfo('ADS-B Blinker:airport',1,'ICAO code, e.g. KMSP');"));
-      oappend(F("addInfo('ADS-B Blinker:radiusNm',1,'NM around the airport (keep small: runways + short final)');"));
-      oappend(F("addInfo('ADS-B Blinker:pollSec',1,'seconds between polls (adsb.fi limit: 1 req/s)');"));
-      oappend(F("addInfo('ADS-B Blinker:airborneKt',1,'ground speed that counts as airborne');"));
-      oappend(F("dd=addDropdown('ADS-B Blinker','mode');"));
-      oappend(F("addOption(dd,'Flash overlay',0);"));
-      oappend(F("addOption(dd,'Apply presets',1);"));
-      oappend(F("addInfo('ADS-B Blinker:depColor',1,'hex RRGGBB (flash mode)');"));
-      oappend(F("addInfo('ADS-B Blinker:arrColor',1,'hex RRGGBB (flash mode)');"));
-      oappend(F("addInfo('ADS-B Blinker:flashLeds',1,'LEDs to flash, 0 = all');"));
-      oappend(F("addInfo('ADS-B Blinker:depPreset',1,'preset ID (preset mode, 0 = none)');"));
-      oappend(F("addInfo('ADS-B Blinker:arrPreset',1,'preset ID (preset mode, 0 = none)');"));
-      oappend(F("addInfo('ADS-B Blinker:resolvedIcao',1,'set automatically');"));
+      // L(field,label,after): relabel a field and add text after it
+      oappend(F("var A='ADS-B Blinker:';"
+        "function I(f){let a=d.getElementsByName(A+f);return a[a.length-1];}"
+        "function L(f,t,u){let i=I(f);if(!i)return;let p=i.previousSibling;"
+          "while(p&&p.nodeType!=3)p=p.previousSibling;if(p)p.textContent=' '+t+' ';"
+          "if(u)i.insertAdjacentHTML('afterend','&nbsp;'+u);}"
+        // wrap a titled group (hr + title + fields) in a div so it can be hidden
+        "function G(t){let c=I('enabled').parentElement,p=[...c.querySelectorAll('p')].find(x=>x.textContent==t);"
+          "if(!p)return cE('div');let w=cE('div'),n=p.previousSibling&&p.previousSibling.nodeName=='HR'?p.previousSibling:p;"
+          "n.before(w);do{let x=n.nextSibling;w.appendChild(n);n=x;}while(n&&n.nodeName!='HR');return w;}"));
+      oappend(F("L('Airport:icao','ICAO code');I('Airport:icao').placeholder='KMSP';"
+        "L('Airport:radius_nm','Radius','NM');"
+        "L('Detection:poll_s','Check every','seconds');"
+        "L('Detection:airborne_kt','Airborne above','knots');"
+        "L('Action:type','When a plane lands or departs');"
+        "L('Flash:departure','Departure color');L('Flash:landing','Landing color');"
+        "L('Flash:count','Flashes');L('Flash:leds','LEDs','(0 = all)');"
+        "L('Preset:departure','Departure preset');L('Preset:landing','Landing preset');"
+        "L('Preset:seconds','Show for','seconds, then restore (0 = leave on)');"
+        "for(let f of['Flash:departure','Flash:landing'])I(f).type='color';"));
+      oappend(F("let s=addDropdown('ADS-B Blinker','Action:type');addOption(s,'Flash the LEDs',0);addOption(s,'Apply a preset',1);"
+        "let gf=G('Flash'),gp=G('Preset'),T=()=>{gf.style.display=s.value==0?'':'none';gp.style.display=s.value==1?'':'none';};"
+        "s.addEventListener('change',T);T();"
+        "let pd=['Preset:departure','Preset:landing'].map(f=>addDropdown('ADS-B Blinker',f));"
+        "pd.forEach(x=>addOption(x,'None',0));"
+        "fetch('/presets.json').then(r=>r.json()).then(j=>{for(let k in j)if(k>0&&j[k].n)pd.forEach(x=>addOption(x,k+': '+j[k].n,k));});"));
     }
 
     // Test from the JSON API: {"adsb":{"test":"dep"}} or {"adsb":{"test":"arr"}}
+    // This runs in the web server's task while WLED is applying the request, so
+    // only queue the event; loop() handles it like a real one.
     void readFromJsonState(JsonObject& root) override {
       JsonObject um = root[F("adsb")];
-      if (um.isNull()) return;
+      if (um.isNull() || !events) return;
       const char* t = um[F("test")] | "";
       if (!*t) return;
       Event ev; ev.kind = (t[0] == 'a') ? LANDING : DEPARTURE;
       strlcpy(ev.callsign, "TEST", sizeof(ev.callsign)); strlcpy(ev.type, "-", sizeof(ev.type));
-      onEvent(ev);
+      xQueueSend(events, &ev, 0);
     }
 
     uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 };
 
 const char AdsbBlinker::_name[] PROGMEM = "ADS-B Blinker";
+const char AdsbBlinker::_cacheFile[] PROGMEM = "/adsb.json";
 
 static AdsbBlinker adsb_blinker;
 REGISTER_USERMOD(adsb_blinker);
