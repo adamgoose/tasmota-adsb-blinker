@@ -58,7 +58,20 @@ The usermod is a PlatformIO library (the manifest is [`library.json`](../library
 
 1. Configure your LEDs as usual in **Config → LED Preferences**.
 2. Open **Config → Usermods**, find **ADS-B Blinker**, tick **Enabled**, set the **ICAO code**, choose an action, and **Save**.
-3. Open the **Info** panel (the ⓘ button in the main UI). The **ADS-B Blinker** line shows the status, for example `KMSP: 14 aircraft | dep 2 arr 3 | last arr SCX612 (B738)`, or an error such as `unknown airport ZZZZ`.
+3. Open the **Info** panel (the ⓘ button in the main UI). The **ADS-B Blinker** line shows the status, for example `KMSP: 14 aircraft · dep 2 arr 3`, or an error such as `unknown airport ZZZZ`.
+
+### Flight log
+
+- **Info panel:** the **Recent flights** row shows the last 3 events (`↓ SWA4833 B738 · 2m ago`) and a **Full log** button.
+- **`http://<wled-ip>/adsb`:** a phone-friendly table of the last 50 landings and departures (time, event, callsign, aircraft type). It refreshes every 10 s. Times are worked out in your browser from each event's age, so they show in your local time even if WLED's NTP is off. If you change airports, earlier entries are tagged with the old airport's code.
+- **`http://<wled-ip>/adsb/log`:** the same data as JSON, newest first:
+  ```json
+  {"icao":"KDEN","status":"KDEN: 14 aircraft","deps":3,"arrs":2,
+   "events":[{"k":"arr","cs":"SWA4833","t":"B738","ap":"KDEN","ago":95}, ...]}
+  ```
+- The log is kept in RAM, so a reboot or firmware update clears it, along with the counts. Test events (see below) show up in the log as `TEST`.
+
+WLED's four bottom tabs (Colors, Effects, Segments, Presets) are hard-coded in its UI, and usermods can only add to the Info panel. That's why the log is a separate page rather than a fifth tab.
 
 ### Settings
 
@@ -121,7 +134,9 @@ curl -X POST http://<wled-ip>/json/state -H 'Content-Type: application/json' -d 
 | `loop()` | Takes events off the queue (`onEvent()`), advances the flash sequence (`runFlash()`), ends an expired preset (`endPreset()`), and saves the cache after a lookup. |
 | `onEvent()` | The output decision: counts the event, then starts a preset or queues a flash. |
 | `handleOverlayDraw()` | Paints the flash color over the first `flashLeds` LEDs on the frames where the flash is on. |
-| `addToJsonInfo()` | The Info panel line. |
+| `logEvent()` / `logAt()` | A 50-entry ring buffer of events (`ADSB_LOG_SIZE`), plus the counts. Written from `loop()`, read by the web server, guarded by `mtx`. Callsigns and types are reduced to `[A-Za-z0-9-]` by `cleanCopy()` before they're stored, because they end up in HTML. |
+| `sendLog()` / `ADSB_PAGE` | `GET /adsb/log` (JSON) and `GET /adsb` (the page, stored in flash). Both are registered in `setup()`; `/adsb/log` comes first because the `/adsb` route also matches anything under `/adsb/`. |
+| `addToJsonInfo()` | The two Info panel rows. Their values are rendered as HTML, which is how the **Full log** button gets there. |
 | `readFromJsonState()` | The `{"adsb":{"test":...}}` hook. |
 
 ### Threading rules
@@ -137,6 +152,7 @@ curl -X POST http://<wled-ip>/json/state -H 'Content-Type: application/json' -d 
 - **Flash pattern:** `runFlash()` steps through on/off phases of `ADSB_FLASH_ON_MS` each, with `ADSB_FLASH_GAP_MS` between events. Replace `fxOn` with a brightness ramp for a pulse instead of a blink.
 - **Memory:** the filtered document is `ADSB_DOC_SIZE` = 24 KB, enough for roughly 200 aircraft. A large radius around a busy area can exceed that; the status then shows `too many aircraft, lower radius`.
 - **Debug output:** build with `-D WLED_DEBUG` to get `ADS-B: dep ...` lines on the serial console.
+- **Longer or persistent log:** raise `ADSB_LOG_SIZE` (each entry is about 30 bytes). To keep the log across reboots, write it to a file the way `saveCache()` does. Avoid writing on every event, though, since that wears the flash.
 
 ## Data and terms
 

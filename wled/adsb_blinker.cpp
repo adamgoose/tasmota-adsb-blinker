@@ -39,6 +39,37 @@
 #define ADSB_FORGET_MS    180000UL  // drop aircraft not seen for 3 minutes
 #define ADSB_FLASH_ON_MS  150
 #define ADSB_FLASH_GAP_MS 400
+#define ADSB_LOG_SIZE     50        // events kept for the log page (RAM only)
+#define ADSB_INFO_RECENT  3         // events shown in the Info panel
+
+// The /adsb log page. Data comes from /adsb/log; times are computed in the
+// browser from each event's age, so they're right even without NTP on the device.
+static const char ADSB_PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Flights</title><style>
+body{background:#222;color:#fff;font-family:Helvetica,Verdana,sans-serif;margin:0;padding:16px;text-align:center}
+h2{margin:8px 0 4px}#s{color:#aaa;font-size:14px;margin-bottom:14px}
+table{margin:0 auto;border-collapse:collapse;width:100%;max-width:560px}
+td,th{padding:9px 6px;border-bottom:1px solid #333;text-align:left}th{color:#aaa;font-weight:normal;font-size:13px}
+.d{color:#5e5}.a{color:#6af}.m{color:#888}
+button{background:#333;color:#fff;border:0;border-radius:24px;padding:8px 20px;margin:8px 4px;font-size:15px;cursor:pointer}
+</style></head><body><button onclick="location.href='/'">Back</button>
+<h2 id="h">Flights</h2><div id="s"></div>
+<table><thead><tr><th>Time</th><th>Event</th><th>Callsign</th><th>Type</th></tr></thead><tbody id="b"></tbody></table>
+<script>
+function E(x){return String(x).replace(/[&<>"']/g,c=>'&#'+c.charCodeAt(0)+';')}
+function f(){fetch('/adsb/log').then(r=>r.json()).then(j=>{
+h.textContent=j.icao?j.icao+' landings & departures':'Flights';
+let P=(n,w)=>n+' '+w+(n==1?'':'s');
+s.textContent=j.status+' · '+P(j.deps,'departure')+', '+P(j.arrs,'landing')+' since boot';
+let n=Date.now();
+b.innerHTML=j.events.length?j.events.map(e=>{let t=new Date(n-e.ago*1000),d=e.k=='dep';
+return '<tr><td>'+t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</td><td class='+(d?'d':'a')+'>'
++(d?'↑ Departure':'↓ Landing')+(e.ap!=j.icao?' <span class=m>'+E(e.ap)+'</span>':'')
++'</td><td>'+E(e.cs)+'</td><td>'+E(e.t)+'</td></tr>'}).join('')
+:'<tr><td colspan=4 class=m style="text-align:center">No landings or departures yet</td></tr>'
+}).catch(()=>{s.textContent='Can\'t reach the device'})}
+f();setInterval(f,10000)
+</script></body></html>)HTML";
 
 // GET https://host/path and parse the JSON body through a filter.
 // HTTP/1.0 so the server never uses chunked encoding and ArduinoJson can read
@@ -111,9 +142,13 @@ class AdsbBlinker : public Usermod {
     bool     lookupDone = false;   // task resolved new coordinates -> save cfg
     char     status[48] = "starting";
 
-    // ---- runtime (main loop only) ----
+    // ---- event log (written in loop, read by the web server; guarded by mtx) ----
+    struct LogEntry { uint32_t ms; uint8_t kind; char callsign[10]; char type[6]; char icao[8]; };
+    LogEntry evLog[ADSB_LOG_SIZE];
+    uint8_t  logHead = 0, logLen = 0;   // logHead = next slot to write
     uint32_t deps = 0, arrs = 0;
-    char     lastEvent[40] = "";
+
+    // ---- runtime (main loop only) ----
     uint32_t fxColor = 0;
     int      fxStep = -1;          // -1 idle; otherwise index into the on/off sequence
     uint32_t fxNext = 0;
@@ -313,10 +348,8 @@ class AdsbBlinker : public Usermod {
         if (ground < 0) { if (it != tracks.end()) it->second.seen = now; continue; }
         if (it != tracks.end() && it->second.ground != (bool)ground) {
           Event ev; ev.kind = ground ? LANDING : DEPARTURE;
-          const char* cs = a["flight"] | hex;
-          strlcpy(ev.callsign, cs, sizeof(ev.callsign));
-          for (int i = strlen(ev.callsign) - 1; i >= 0 && ev.callsign[i] == ' '; i--) ev.callsign[i] = 0;
-          strlcpy(ev.type, a["t"] | "?", sizeof(ev.type));
+          cleanCopy(ev.callsign, a["flight"] | hex, sizeof(ev.callsign));
+          cleanCopy(ev.type, a["t"] | "?", sizeof(ev.type));
           xQueueSend(events, &ev, 0);
         }
         tracks[id] = { (bool)ground, now };
@@ -330,10 +363,58 @@ class AdsbBlinker : public Usermod {
 
     // ---------- output (main loop) ----------
 
-    void onEvent(const Event& ev) {
+    // Copy keeping only [A-Za-z0-9-] (the text ends up in HTML), "?" if nothing is left
+    static void cleanCopy(char* dst, const char* src, size_t n) {
+      size_t j = 0;
+      for (; *src && j + 1 < n; src++) if (isalnum((unsigned char)*src) || *src == '-') dst[j++] = *src;
+      if (!j && n > 1) dst[j++] = '?';
+      dst[j] = 0;
+    }
+
+    void logEvent(const Event& ev) {
+      xSemaphoreTake(mtx, portMAX_DELAY);
+      LogEntry& e = evLog[logHead];
+      e.ms = millis(); e.kind = ev.kind;
+      strlcpy(e.callsign, ev.callsign, sizeof(e.callsign));
+      strlcpy(e.type, ev.type, sizeof(e.type));
+      strlcpy(e.icao, airport.c_str(), sizeof(e.icao));
+      logHead = (logHead + 1) % ADSB_LOG_SIZE;
+      if (logLen < ADSB_LOG_SIZE) logLen++;
       if (ev.kind == DEPARTURE) deps++; else arrs++;
-      snprintf(lastEvent, sizeof(lastEvent), "%s %s (%s)", ev.kind == DEPARTURE ? "dep" : "arr", ev.callsign, ev.type);
-      DEBUG_PRINTF_P(PSTR("ADS-B: %s\n"), lastEvent);
+      xSemaphoreGive(mtx);
+    }
+
+    // i = 0 is the newest entry; call with mtx held
+    const LogEntry& logAt(uint8_t i) { return evLog[(logHead + ADSB_LOG_SIZE - 1 - i) % ADSB_LOG_SIZE]; }
+
+    static void fmtAgo(char* out, size_t n, uint32_t ms) {
+      uint32_t s = (millis() - ms) / 1000;
+      if (s < 60)        snprintf(out, n, "just now");
+      else if (s < 3600) snprintf(out, n, "%um ago", (unsigned)(s / 60));
+      else               snprintf(out, n, "%uh ago", (unsigned)(s / 3600));
+    }
+
+    // GET /adsb/log -> {"icao","status","deps","arrs","events":[{"k","cs","t","ap","ago"}]} (newest first)
+    void sendLog(AsyncWebServerRequest* request) {
+      DynamicJsonDocument doc(512 + ADSB_LOG_SIZE * 160);
+      xSemaphoreTake(mtx, portMAX_DELAY);
+      doc["icao"] = airport; doc["status"] = status; doc["deps"] = deps; doc["arrs"] = arrs;
+      JsonArray evs = doc.createNestedArray("events");
+      for (uint8_t i = 0; i < logLen; i++) {
+        const LogEntry& e = logAt(i);
+        JsonObject o = evs.createNestedObject();
+        o["k"] = e.kind == DEPARTURE ? "dep" : "arr";
+        o["cs"] = e.callsign; o["t"] = e.type; o["ap"] = e.icao;
+        o["ago"] = (millis() - e.ms) / 1000;
+      }
+      xSemaphoreGive(mtx);
+      String out; serializeJson(doc, out);
+      request->send(200, F("application/json"), out);
+    }
+
+    void onEvent(const Event& ev) {
+      logEvent(ev);
+      DEBUG_PRINTF_P(PSTR("ADS-B: %s %s (%s)\n"), ev.kind == DEPARTURE ? "dep" : "arr", ev.callsign, ev.type);
       if (mode == MODE_PRESET) {
         startPreset(ev.kind == DEPARTURE ? depPreset : arrPreset);
         return;
@@ -370,6 +451,11 @@ class AdsbBlinker : public Usermod {
       if (isnan(lat)) loadCache();
       else saveCache();              // migrated from cfg.json (older versions kept it there)
       xTaskCreate(taskEntry, "adsb", ADSB_TASK_STACK, this, 1, &task);
+      // the log page and its data (registered once, before WLED's catch-all handler)
+      server.on(F("/adsb/log"), HTTP_GET, [this](AsyncWebServerRequest* r) { sendLog(r); });
+      server.on(F("/adsb"), HTTP_GET, [](AsyncWebServerRequest* r) {
+        r->send_P(200, PSTR("text/html"), ADSB_PAGE);
+      });
     }
 
     void loop() override {
@@ -393,13 +479,25 @@ class AdsbBlinker : public Usermod {
     void addToJsonInfo(JsonObject& root) override {
       JsonObject user = root["u"];
       if (user.isNull()) user = root.createNestedObject("u");
+      // The Info panel renders these values as HTML
       char line[96];
+      String recent;
       xSemaphoreTake(mtx, portMAX_DELAY);
-      snprintf(line, sizeof(line), "%s | dep %u arr %u%s%s", status, (unsigned)deps, (unsigned)arrs,
-               lastEvent[0] ? " | last " : "", lastEvent);
+      snprintf(line, sizeof(line), "%s &middot; dep %u arr %u", status, (unsigned)deps, (unsigned)arrs);
+      for (uint8_t i = 0; i < logLen && i < ADSB_INFO_RECENT; i++) {
+        const LogEntry& e = logAt(i);
+        char ago[16]; fmtAgo(ago, sizeof(ago), e.ms);
+        char row[64];
+        snprintf(row, sizeof(row), "%s %s %s &middot; %s<br>", e.kind == DEPARTURE ? "&uarr;" : "&darr;", e.callsign, e.type, ago);
+        recent += row;
+      }
       xSemaphoreGive(mtx);
-      JsonArray arr = user.createNestedArray(F("ADS-B Blinker"));
-      arr.add(line);
+      if (!recent.length()) recent = F("none yet<br>");
+      // (btn-xs is a fixed-size round icon button, so size this one explicitly)
+      recent += F("<button class=\"btn\" style=\"width:auto;height:auto;min-width:0;padding:4px 14px;margin:6px 0 0;"
+                  "font-size:13px;white-space:nowrap\" onclick=\"location.href='/adsb'\">Full log</button>");
+      user.createNestedArray(F("ADS-B Blinker")).add(line);
+      user.createNestedArray(F("Recent flights")).add(recent);
     }
 
     // Settings are grouped into nested objects; WLED shows each one as a titled
